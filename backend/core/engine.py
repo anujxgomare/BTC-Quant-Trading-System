@@ -38,6 +38,8 @@ class TradingEngine:
         self.signal_eng= get_signal_engine()
         self.trades    = get_trade_manager()
         self.notifier  = get_notifier()
+        self.last_trained_time = None
+        self.retrain_interval = 7200  # 2 hours
 
         # Shared state (updated by background threads, read by API)
         self.state = {
@@ -76,28 +78,37 @@ class TradingEngine:
             self._threads.append(t)
         logger.info("All engine threads started")
 
-    # ── Training loop ─────────────────────────────────────────────────────────
+    # =============================================================================
+# backend/core/engine.py — FIXED (NO RETRAIN LOOP + NO CRASH)
+# =============================================================================
+
+# ONLY SHOWING CHANGED PARTS
+
     def _train_loop(self):
-        """Train once on startup, then every MODEL_RETRAIN_BARS new bars."""
-        bar_count = 0
-        while self._running:
-            try:
-                self.state["training"] = True
-                logger.info("Fetching data for training...")
-                dfs_raw = self.fetcher.fetch_all_timeframes(force=True)
-                if not dfs_raw:
-                    time.sleep(30)
-                    continue
-                self._dfs_ind = self.ind_eng.compute_all(dfs_raw)
-                metrics = self.ml_eng.train(self._dfs_ind)
-                self.state["trained"]  = True
-                self.state["training"] = False
-                logger.info(f"Training done: {metrics}")
-            except Exception as e:
-                logger.error(f"Training error: {e}")
-                self.state["training"] = False
-                self.state["error"]    = str(e)
-            time.sleep(MODEL_RETRAIN_BARS * _tf_to_sec(PRIMARY_TF))
+        """Train ONLY ONCE at startup"""
+        try:
+            self.state["training"] = True
+            logger.info("Fetching data for training...")
+
+            dfs_raw = self.fetcher.fetch_all_timeframes(force=True)
+
+            if not dfs_raw:
+                logger.error("No data for training")
+                return
+
+            self._dfs_ind = self.ind_eng.compute_all(dfs_raw)
+
+            metrics = self.ml_eng.train(self._dfs_ind)
+
+            self.state["trained"]  = True
+            self.state["training"] = False
+            self.last_trained_time = time.time()  # ✅ TRACK TIME
+
+            logger.info(f"Training done: {metrics}")
+
+        except Exception as e:
+            logger.error(f"Training error: {e}")
+            self.state["error"] = str(e)
 
     # ── Price loop ────────────────────────────────────────────────────────────
     def _price_loop(self):
@@ -119,7 +130,7 @@ class TradingEngine:
                 logger.error(f"Price loop error: {e}")
             time.sleep(PRICE_UPDATE_SEC)
 
-    # ── Signal loop ───────────────────────────────────────────────────────────
+    # Signal Loop
     def _signal_loop(self):
         # Wait for training
         while self._running and not self.state["trained"]:
@@ -127,8 +138,23 @@ class TradingEngine:
 
         while self._running:
             try:
+
+                # 🔁 ✅ ADD IT HERE (TOP OF LOOP)
+                if self.last_trained_time:
+                    if time.time() - self.last_trained_time > self.retrain_interval:
+                        logger.info("Retraining model after interval...")
+                        self.ml_eng.is_trained = False   # ✅ reset flag
+                        self._train_loop()
+
+                # -----------------------------
                 # Refresh data
                 dfs_raw = self.fetcher.fetch_all_timeframes()
+
+                if not dfs_raw:
+                    logger.warning("No data fetched — skipping cycle")
+                    time.sleep(SIGNAL_UPDATE_SEC)
+                    continue
+
                 self._dfs_ind = self.ind_eng.compute_all(dfs_raw)
 
                 # MTF analysis
@@ -140,6 +166,7 @@ class TradingEngine:
                 ml_pred = {}
                 if df_primary is not None and not df_primary.empty:
                     ml_pred = self.ml_eng.predict(df_primary, df_primary)
+
                 self.state["ml"] = ml_pred
 
                 # Sentiment
@@ -153,37 +180,38 @@ class TradingEngine:
                 sig = self.signal_eng.generate(
                     self._dfs_ind, mtf, ml_pred, sent, ob
                 )
-                
-                # Auto-open trade if signal is strong enough
+
+                self.state["signal"] = sig
+                self.state["last_signal"] = datetime.utcnow().isoformat()
+
+                # Auto-open trade
                 if (sig.get("direction") != "FLAT" and
-                        sig.get("confidence", 0) >= SIGNAL_CONFIDENCE_MIN and
-                        sig.get("entry") is not None):
+                    sig.get("confidence", 0) >= SIGNAL_CONFIDENCE_MIN and
+                    sig.get("entry") is not None):
 
                     new_trade = self.trades.open_trade(sig)
 
                     if new_trade:
                         logger.info(f"Auto-opened trade: {new_trade.direction}")
 
-                        # 🔥 SEND TELEGRAM ALERT
                         msg = f"""
-                🟢 NEW {sig['direction']} SIGNAL
-                ━━━━━━━━━━━━━━━━━━━
-                📍 Entry:      ${sig['entry']:.2f}
-                🛑 Stop Loss:  ${sig['stop_loss']:.2f}
-                🎯 Take Profit:${sig['take_profit']:.2f}
-                🔒 Breakeven:  ${sig['breakeven']:.2f}
-                ⚖️ R:R Ratio:  1:{sig['risk_reward']}
-                📊 Confidence: {sig['confidence']:.1f}%
-                💰 Risk:       ${risk_usd:.2f}
-                📦 Size:       {position_size:.5f} BTC
-                ⏰ Time:       {datetime.utcnow().strftime("%H:%M UTC")}
-                """
+                        NEW {sig['direction']} SIGNAL
+                        ━━━━━━━━━━━━━━━━━━━
+                        Entry:      ${sig['entry']:.2f}
+                        Stop Loss:  ${sig['stop_loss']:.2f}
+                        Take Profit:${sig['take_profit']:.2f}
+                        Breakeven:  ${sig['breakeven']:.2f}
+                        R:R Ratio:  1:{sig['risk_reward']}
+                        Confidence: {sig['confidence']:.1f}%
+                        Time:       {datetime.utcnow().strftime("%H:%M UTC")}
+                        """
 
                         self.notifier.send(msg)
 
             except Exception as e:
                 logger.error(f"Signal loop error: {e}", exc_info=True)
                 self.state["error"] = str(e)
+
             time.sleep(SIGNAL_UPDATE_SEC)
 
     # ── Trade management loop ─────────────────────────────────────────────────

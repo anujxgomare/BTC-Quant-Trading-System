@@ -1,5 +1,5 @@
 # =============================================================================
-# backend/ml/ml_engine.py — FINAL (UI FIX + TP/SL + FULL OUTPUT)
+# backend/ml/ml_engine.py — FIXED (REAL ACCURACY + NO OVERFITTING)
 # =============================================================================
 import numpy as np
 import pandas as pd
@@ -8,31 +8,16 @@ import logging
 import os
 from pathlib import Path
 import sys
-
+import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from config.settings import *
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit, train_test_split
 from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
 
-logger = logging.getLogger(__name__)
-
-# ── LSTM SUPPORT ─────────────────────────────────────────────
-try:
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    from tensorflow.keras.models import Sequential, load_model
-    from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-    from tensorflow.keras.optimizers import Adam
-    LSTM_AVAILABLE = True
-except ImportError:
-    LSTM_AVAILABLE = False
-    logger.warning("TensorFlow not available — LSTM disabled")
-
-
-# ── FEATURES ─────────────────────────────────────────────
 ML_FEATURES = [
     "ema_score", "ema50_dist",
     "rsi", "rsi_score",
@@ -45,30 +30,24 @@ ML_FEATURES = [
     "swing_high", "swing_low",
 ]
 
+logger = logging.getLogger(__name__)
 
 class MLEngine:
 
     def __init__(self):
         self.xgb = None
         self.rf = None
-        self.lstm = None
-
         self.scaler = RobustScaler()
-        self.scaler_l = RobustScaler()
-
         self.is_trained = False
-
         self._model_path = MODEL_DIR / "xgb_rf.pkl"
-        self._lstm_path = MODEL_DIR / "lstm.keras"
         self._feature_cols = []
-
         self._load_if_exists()
+        self.last_trained_time = None
+        self.min_retrain_gap = 7200  # 2 hours
 
-    # ── TP/SL LABEL ─────────────────────────
     def label(self, df):
-
         tp_pct = 0.003
-        sl_pct = 0.0015
+        sl_pct = 0.002
 
         labels = []
 
@@ -76,26 +55,19 @@ class MLEngine:
             entry = df["close"].iloc[i]
             future = df.iloc[i+1:i+30]
 
-            tp_hit = False
-            sl_hit = False
+            tp_hit = any(row["high"] >= entry * (1 + tp_pct) for _, row in future.iterrows())
+            sl_hit = any(row["low"] <= entry * (1 - sl_pct) for _, row in future.iterrows())
 
-            for _, row in future.iterrows():
-                if row["high"] >= entry * (1 + tp_pct):
-                    tp_hit = True
-                    break
-                if row["low"] <= entry * (1 - sl_pct):
-                    sl_hit = True
-                    break
-
-            if tp_hit:
+            if tp_hit and not sl_hit:
                 labels.append(1)  # LONG
-            else:
+            elif sl_hit and not tp_hit:
                 labels.append(0)  # SHORT
+            else:
+                labels.append(None)
 
         df["label"] = labels
         return df
 
-    # ── BUILD FEATURES ─────────────────────────
     def _build_X(self, df):
         cols = [c for c in ML_FEATURES if c in df.columns]
         X = df[cols].copy()
@@ -106,8 +78,13 @@ class MLEngine:
         X.fillna(0, inplace=True)
         return X, cols
 
-    # ── TRAIN ─────────────────────────
-    def train(self, dfs):
+    # Train
+    def train(self, dfs, force=False):
+        # ✅ Prevent unnecessary retraining
+        if self.is_trained and not force:
+            if self.last_trained_time and (time.time() - self.last_trained_time < self.min_retrain_gap):
+                logger.info("Skipping training — recently trained")
+                return {"status": "skipped"}
 
         logger.info("Training ML models...")
 
@@ -123,80 +100,43 @@ class MLEngine:
         y = df["label"].values
 
         self._feature_cols = cols
-
         X_sc = self.scaler.fit_transform(X)
 
+        # ✅ TIME-SERIES SAFE SPLIT
+        split = int(len(X_sc) * 0.8)
+        X_train, X_test = X_sc[:split], X_sc[split:]
+        y_train, y_test = y[:split], y[split:]
+
         self.xgb = XGBClassifier(
-            n_estimators=300,
-            max_depth=5,
+            n_estimators=250,
+            max_depth=4,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
             eval_metric="logloss",
         )
 
-        self.rf = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=10,
-        )
+        self.rf = RandomForestClassifier(n_estimators=150, max_depth=8)
 
-        tscv = TimeSeriesSplit(n_splits=5)
+        self.xgb.fit(X_train, y_train)
+        self.rf.fit(X_train, y_train)
 
-        for tr, te in tscv.split(X_sc):
-            self.xgb.fit(X_sc[tr], y[tr])
-            self.rf.fit(X_sc[tr], y[tr])
-
-        self.xgb.fit(X_sc, y)
-        self.rf.fit(X_sc, y)
-
-        if LSTM_AVAILABLE:
-            self._train_lstm(df, cols)
+        y_pred = self.xgb.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
 
         self.is_trained = True
+        self.last_trained_time = time.time()
+
         self._save()
 
-        return {"samples": len(df), "features": len(cols)}
+        logger.info(f"Real Model Accuracy: {acc * 100:.2f}%")
 
-    # ── LSTM ─────────────────────────
-    def _train_lstm(self, df, cols):
-        try:
-            X_raw = df[cols].values.astype(np.float32)
-            y_raw = df["label"].values
+        return {
+            "samples": len(df),
+            "features": len(cols),
+            "accuracy": round(acc * 100, 2)
+        }
 
-            X_sc = self.scaler_l.fit_transform(X_raw)
-
-            seq = LSTM_SEQ_LEN
-            Xs, ys = [], []
-
-            for i in range(seq, len(X_sc)):
-                Xs.append(X_sc[i-seq:i])
-                ys.append(y_raw[i])
-
-            Xs, ys = np.array(Xs), np.array(ys)
-
-            model = Sequential([
-                LSTM(64, return_sequences=True, input_shape=(seq, len(cols))),
-                Dropout(0.2),
-                BatchNormalization(),
-                LSTM(32),
-                Dense(2, activation="softmax"),
-            ])
-
-            model.compile(
-                optimizer=Adam(1e-3),
-                loss="sparse_categorical_crossentropy",
-                metrics=["accuracy"]
-            )
-
-            model.fit(Xs, ys, epochs=10, batch_size=64, verbose=0)
-
-            self.lstm = model
-            model.save(str(self._lstm_path))
-
-        except Exception as e:
-            logger.error(f"LSTM error: {e}")
-
-    # ── PREDICT ─────────────────────────
     def predict(self, df, df_seq=None):
 
         if not self.is_trained:
@@ -211,49 +151,25 @@ class MLEngine:
         X = X[self._feature_cols]
         X_sc = self.scaler.transform(X)
 
-        # ── MODEL OUTPUTS ─────────────────
         xgb_p = self.xgb.predict_proba(X_sc)[0]
         rf_p = self.rf.predict_proba(X_sc)[0]
 
-        xgb_class = int(np.argmax(xgb_p))
-        rf_class = int(np.argmax(rf_p))
-
-        lstm_p = np.array([0.5, 0.5])
-        lstm_used = False
-
-        if LSTM_AVAILABLE and self.lstm is not None and df_seq is not None:
-            try:
-                seq = df_seq[self._feature_cols].values[-LSTM_SEQ_LEN:]
-                seq = self.scaler_l.transform(seq)
-                lstm_p = self.lstm.predict(seq[np.newaxis], verbose=0)[0]
-                lstm_used = True
-            except:
-                pass
-
-        # ── ENSEMBLE ─────────────────
-        blend = 0.5 * xgb_p + 0.3 * rf_p + 0.2 * lstm_p
+        blend = 0.6 * xgb_p + 0.4 * rf_p
 
         pred = int(np.argmax(blend))
         confidence = round(float(blend[pred]) * 100, 1)
 
         label_map = {0: "SHORT", 1: "LONG"}
+        if confidence < 55:
+            return {"prediction": "FLAT", "confidence": confidence}
 
         return {
             "prediction": label_map[pred],
             "confidence": confidence,
-
-            # ✅ FIX FOR UI
-            "xgb_pred": label_map[xgb_class],
-            "rf_pred": label_map[rf_class],
-
-            # optional
             "p_long": round(float(blend[1]) * 100, 1),
             "p_short": round(float(blend[0]) * 100, 1),
-
-            "lstm_used": lstm_used
         }
 
-    # ── SAVE/LOAD ─────────────────────────
     def _save(self):
         joblib.dump({
             "xgb": self.xgb,
@@ -274,7 +190,6 @@ class MLEngine:
                 logger.info("Loaded existing ML models")
             except Exception as e:
                 logger.warning(f"Load failed: {e}")
-
 
 _ml_engine = MLEngine()
 
